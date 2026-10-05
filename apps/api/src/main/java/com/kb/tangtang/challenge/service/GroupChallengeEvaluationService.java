@@ -15,6 +15,7 @@ import lombok.extern.log4j.Log4j2;
 import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Isolation;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.math.BigDecimal;
@@ -22,6 +23,7 @@ import java.text.NumberFormat;
 import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -87,6 +89,82 @@ public class GroupChallengeEvaluationService {
         for (IndictmentTarget target : findTargets(group, today, dates)) {
             if (indict(group, target)) {
                 created++;
+            }
+        }
+        return created;
+    }
+
+    /**
+     * [perf-ts] 그룹 여러 개를 트랜잭션 하나에서 평가한다. 판정 규칙은 {@link #evaluate} 와 같다.
+     *
+     * <p>그룹마다 문장을 보내지 않고, 같은 SQL 을 그룹 묶음에 IN 조건으로 한 번씩 보낸다.
+     * 기간평가 기소 대상만 그룹별로 본다 — 종료 다음 날 하루만 호출되는 경로라 그룹 수가 적다.
+     *
+     * <p><b>READ COMMITTED 로 실행한다.</b> REPEATABLE READ 에서 INSERT ... SELECT 는 원본
+     * tbl_transaction 의 읽은 행과 간격에 공유 넥스트키 락을 건다. 묶음이 커져 트랜잭션이 길어지면
+     * 그동안 오늘 결제 저장(INSERT)과 카테고리 갱신(UPDATE)이 기다리고, 카테고리 갱신과는
+     * 교착까지 생긴다(perf-ts 측정). 매 틱 다시 집계하는 값이라 문장 단위 최신 읽기로 충분하다.
+     *
+     * @return 이번 묶음에서 만든 기소 수
+     */
+    @Transactional(isolation = Isolation.READ_COMMITTED)
+    public int evaluateChunk(List<ChallengeGroup> groups, LocalDate today) {
+        Map<Long, ChallengeGroup> byId = new LinkedHashMap<>();
+        for (ChallengeGroup group : groups) {
+            byId.put(group.getId(), group);
+        }
+
+        /* 1. 날짜마다, 그 날짜가 기간 안에 드는 그룹만 모아 한 번에 재집계 */
+        Map<LocalDate, List<Long>> idsByDate = new LinkedHashMap<>();
+        for (LocalDate date : List.of(today.minusDays(1), today)) {
+            List<Long> ids = new ArrayList<>();
+            for (ChallengeGroup group : groups) {
+                if (!date.isBefore(group.getStartDate()) && !date.isAfter(group.getEndDate())) {
+                    ids.add(group.getId());
+                }
+            }
+            if (!ids.isEmpty()) {
+                resultMapper.upsertDailyResultsForGroups(ids, date);
+                idsByDate.put(date, ids);
+            }
+        }
+
+        /* 2. 감액 이상 행 경고 (evaluate 의 warnDeductionOverflow 와 같은 내용) */
+        for (GroupChallengeDailyResult row : resultMapper.findDeductionOverflowForGroups(new ArrayList<>(byId.keySet()))) {
+            log.warn("감액이 집계액을 넘었다 groupId={} userId={} date={} 집계={} 감액={}"
+                            + " — 환불·카테고리 재분류로 집계액이 줄었을 수 있다",
+                    row.getGroupId(), row.getUserId(), row.getChallengeDate(),
+                    row.getDailyAmount(), row.getVerdictDeductionAmount());
+        }
+
+        int created = 0;
+
+        /* 3-1. 일일평가: 방금 집계한 날짜를 묶음으로 다시 본다 */
+        for (Map.Entry<LocalDate, List<Long>> entry : idsByDate.entrySet()) {
+            List<Long> dailyIds = new ArrayList<>();
+            for (Long id : entry.getValue()) {
+                if (!EvalType.PERIOD.name().equals(byId.get(id).getEvalType())) {
+                    dailyIds.add(id);
+                }
+            }
+            if (dailyIds.isEmpty()) {
+                continue;
+            }
+            for (IndictmentTarget target : resultMapper.findOverLimitDailyForGroups(dailyIds, entry.getKey())) {
+                if (indict(byId.get(target.getGroupId()), target)) {
+                    created++;
+                }
+            }
+        }
+
+        /* 3-2. 기간평가: 챌린지가 끝난 그룹만, 그룹별로 */
+        for (ChallengeGroup group : groups) {
+            if (EvalType.PERIOD.name().equals(group.getEvalType()) && today.isAfter(group.getEndDate())) {
+                for (IndictmentTarget target : resultMapper.findOverLimitPeriod(group.getId())) {
+                    if (indict(group, target)) {
+                        created++;
+                    }
+                }
             }
         }
         return created;

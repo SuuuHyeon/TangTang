@@ -206,4 +206,17 @@ public interface GroupChallengeResultMapper {
      */
     LocalDate findLastSettlementDate(@Param("groupId") Long groupId,
                                      @Param("today") LocalDate today);
+
+    /* ── [perf-ts] 평가 배치 묶음 처리 ─────────────────────────────────────
+     * 아래 세 메서드는 위 upsertDailyResults · findOverLimitDaily · findDeductionOverflow 와
+     * SQL 이 같고 WHERE 의 그룹 조건만 IN 으로 넓힌 것이다. 그룹마다 문장을 보내던 것을
+     * 그룹 묶음당 한 번으로 줄이려고 둔다(GroupChallengeEvaluationService#evaluateChunk).
+     */
+    int upsertDailyResultsForGroups(@Param("groupIds") List<Long> groupIds,
+                                    @Param("challengeDate") LocalDate challengeDate);
+
+    List<IndictmentTarget> findOverLimitDailyForGroups(@Param("groupIds") List<Long> groupIds,
+                                                       @Param("challengeDate") LocalDate challengeDate);
+
+    List<GroupChallengeDailyResult> findDeductionOverflowForGroups(@Param("groupIds") List<Long> groupIds);
 }

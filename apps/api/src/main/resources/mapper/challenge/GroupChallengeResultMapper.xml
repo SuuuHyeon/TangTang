@@ -476,4 +476,71 @@
          WHERE r.group_id = #{groupId}
            AND r.challenge_date &lt; #{today}
     </select>
+
+    <!--
+      ── [perf-ts] 평가 배치 묶음 처리 ─────────────────────────────────────
+
+      upsertDailyResults · findOverLimitDaily · findDeductionOverflow 와 SQL 이 같다.
+      WHERE 의 그룹 조건만 IN 으로 넓혔다. 식을 고칠 때는 위 원본과 함께 고친다.
+
+      ⚠ 이 INSERT ... SELECT 를 REPEATABLE READ 에서 실행하면 원본(tbl_transaction)의 읽은 행과
+        그 사이 간격에 공유 넥스트키 락이 걸린다. 그룹 하나일 때는 잠깐이라 문제가 없지만 묶음이
+        커지면 오늘 결제 저장(INSERT)과 카테고리 갱신(UPDATE)이 기다리거나 교착에 빠진다.
+        그래서 호출부가 READ COMMITTED 로 실행한다(binlog_format=ROW 전제).
+    -->
+    <insert id="upsertDailyResultsForGroups">
+        INSERT INTO tbl_group_challenge_daily_result
+            (group_id, user_id, challenge_date, daily_amount, target_count)
+        SELECT m.group_id,
+               m.user_id,
+               #{challengeDate},
+               COALESCE(SUM(CASE WHEN t.is_refund = 1
+                                 THEN -COALESCE(t.refunded_amount, t.amount)
+                                 ELSE t.amount
+                            END), 0),
+               COALESCE(SUM(CASE WHEN t.id IS NOT NULL AND t.is_refund = 0
+                                 THEN 1 ELSE 0
+                            END), 0)
+          FROM tbl_group_member m
+          JOIN tbl_challenge_group g ON g.id = m.group_id
+          LEFT JOIN tbl_transaction t
+                 ON t.user_id = m.user_id
+                AND t.tr_date = #{challengeDate}
+                <include refid="consumptionFilter"/>
+         WHERE m.group_id IN <foreach collection="groupIds" item="gid" open="(" separator="," close=")">#{gid}</foreach>
+         GROUP BY m.group_id, m.user_id
+        ON DUPLICATE KEY UPDATE
+            daily_amount = VALUES(daily_amount),
+            target_count = VALUES(target_count)
+    </insert>
+
+    <select id="findOverLimitDailyForGroups" resultType="com.kb.tangtang.challenge.domain.IndictmentTarget">
+        SELECT r.id             AS result_id,
+               r.group_id       AS group_id,
+               r.user_id        AS user_id,
+               r.challenge_date AS challenge_date,
+               r.effective_amount AS amount,
+               <include refid="displayNickname"/> AS nickname
+          FROM tbl_group_challenge_daily_result r
+          JOIN tbl_challenge_group g ON g.id = r.group_id
+          JOIN tbl_user u ON u.id = r.user_id
+         WHERE r.group_id IN <foreach collection="groupIds" item="gid" open="(" separator="," close=")">#{gid}</foreach>
+           AND r.challenge_date = #{challengeDate}
+           AND r.effective_amount &gt; g.limit_amount
+           AND NOT EXISTS (SELECT 1 FROM tbl_indictment i WHERE i.result_id = r.id)
+         ORDER BY r.group_id, r.user_id
+    </select>
+
+    <select id="findDeductionOverflowForGroups"
+            resultType="com.kb.tangtang.challenge.domain.GroupChallengeDailyResult">
+        SELECT r.id, r.group_id, r.user_id, r.challenge_date,
+               r.daily_amount, r.verdict_deduction_amount, r.effective_amount, r.target_count
+          FROM tbl_group_challenge_daily_result r
+          JOIN tbl_challenge_group g ON g.id = r.group_id
+         WHERE r.group_id IN <foreach collection="groupIds" item="gid" open="(" separator="," close=")">#{gid}</foreach>
+           AND g.eval_type = 'DAILY'
+           AND r.verdict_deduction_amount &gt; 0
+           AND r.verdict_deduction_amount &gt; r.daily_amount
+         ORDER BY r.group_id, r.user_id, r.challenge_date
+    </select>
 </mapper>

@@ -29,6 +29,13 @@ import java.util.List;
 @Log4j2
 public class GroupChallengeEvaluationBatchService {
 
+    /**
+     * [perf-ts] 한 트랜잭션에서 함께 평가하는 그룹 수.
+     * 그룹마다 문장 5개와 커밋 1번을 보내던 것을 묶음마다 한 번으로 줄인다.
+     * 너무 크게 잡으면 트랜잭션이 길어지고 실패 시 다시 도는 범위가 넓어진다.
+     */
+    static final int CHUNK_SIZE = 100;
+
     private final ChallengeGroupMapper challengeGroupMapper;
     private final GroupChallengeEvaluationService evaluationService;
 
@@ -54,12 +61,25 @@ public class GroupChallengeEvaluationBatchService {
         }
 
         int indicted = 0;
-        for (ChallengeGroup group : groups) {
+        for (int from = 0; from < groups.size(); from += CHUNK_SIZE) {
+            List<ChallengeGroup> chunk = groups.subList(from, Math.min(from + CHUNK_SIZE, groups.size()));
             try {
-                indicted += evaluationService.evaluate(group, today);
+                indicted += evaluationService.evaluateChunk(chunk, today);
             } catch (RuntimeException e) {
-                /* 한 그룹의 실패가 나머지를 막지 않는다. 5분 뒤 다음 실행이 다시 집어 간다 */
-                log.error("그룹 챌린지 평가 실패 groupId={}", group.getId(), e);
+                /*
+                 * 묶음 하나가 실패하면 그 묶음만 원래 방식(그룹 하나 = 트랜잭션 하나)으로 다시 돈다.
+                 * 묶음 트랜잭션은 통째로 롤백됐고, 다시 돌려도 결산은 UPSERT, 기소는 uk_ind_result 라
+                 * 같은 결과가 된다. 그룹별 처리에서 한 그룹의 실패가 나머지를 막지 않는 것은 그대로다.
+                 */
+                log.warn("그룹 챌린지 묶음 평가 실패, 그룹별로 다시 평가한다 groupIds={}~{}",
+                        chunk.get(0).getId(), chunk.get(chunk.size() - 1).getId(), e);
+                for (ChallengeGroup group : chunk) {
+                    try {
+                        indicted += evaluationService.evaluate(group, today);
+                    } catch (RuntimeException ex) {
+                        log.error("그룹 챌린지 평가 실패 groupId={}", group.getId(), ex);
+                    }
+                }
             }
         }
         log.info("그룹 챌린지 평가 배치 완료 today={} 대상={} 기소={} elapsedMs={}",

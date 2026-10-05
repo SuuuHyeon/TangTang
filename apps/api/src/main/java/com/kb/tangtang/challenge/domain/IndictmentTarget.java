@@ -36,6 +36,8 @@ public class IndictmentTarget {
      * {@code tbl_indictment.result_id} 의 UNIQUE(uk_ind_result)가 여기에 걸린다.
      */
     private Long resultId;
+    /** 묶음 조회(findOverLimitDailyForGroups)에서만 채워진다. 그룹별 조회에서는 NULL */
+    private Long groupId;
 
     private Long userId;
 
