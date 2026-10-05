@@ -1,0 +1,89 @@
+# =====================================================================
+# 트러블슈팅 실험용 로컬 환경 (perf-ts)
+#
+# 원래 docker-compose.yml 과 다른 점
+#   - 목서버(mock)가 없다. 실험에서 계좌 연동을 부르지 않는다
+#   - DB 초기화를 initdb/01_init.sh 가 한다. 원래 파일은 ./db 폴더의 SQL 을 이름순으로 전부 돌리는데,
+#     cleanup_*.sql 이 schema.sql 보다 먼저 실행돼 빈 볼륨에서는 초기화가 실패한다
+#   - 외부 API 키는 전부 가짜 값이다
+#   - 배치 주기를 .env.perf 에서 바꿀 수 있다
+#
+# 실행 (Monorepo 루트에서)
+#   docker compose -f perf-ts/docker-compose.perf.yml --env-file perf-ts/.env.perf up -d --build
+# =====================================================================
+name: tangtang-perf
+
+services:
+  db:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: tangtang
+      MYSQL_USER: tangtang
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+      TZ: Asia/Seoul
+    ports:
+      - "127.0.0.1:3307:3306"
+    volumes:
+      - perf_mysql:/var/lib/mysql
+      - ./initdb:/docker-entrypoint-initdb.d:ro
+      - ../db:/tangtang-db:ro
+    command: --character-set-server=utf8mb4 --collation-server=utf8mb4_general_ci
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build:
+      context: ..
+      dockerfile: apps/api/Dockerfile
+    environment:
+      APP_ENV: docker
+      JDBC_DRIVER: net.sf.log4jdbc.sql.jdbcapi.DriverSpy
+      JDBC_URL: jdbc:log4jdbc:mysql://db:3306/tangtang?useUnicode=true&characterEncoding=UTF-8&serverTimezone=Asia/Seoul
+      JDBC_USERNAME: tangtang
+      JDBC_PASSWORD: ${MYSQL_PASSWORD}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      JWT_SECRET: ${JWT_SECRET}
+      GOOGLE_OAUTH_CLIENT_ID: perf-dummy
+      GOOGLE_OAUTH_CLIENT_SECRET: perf-dummy
+      GOOGLE_OAUTH_REDIRECT_URI: http://localhost:5173/api/auth/google/callback
+      APP_FRONT_URL: http://localhost:5173
+      AUTH_COOKIE_SECURE: "false"
+      OPENAI_API_KEY: perf-dummy
+      CODEF_API_URL: http://localhost:9
+      CODEF_CLIENT_ID: perf-dummy
+      CODEF_CLIENT_SECRET: perf-dummy
+      MOCK_API_URL: http://localhost:9
+      MOCK_SERVER_BASE_URL: http://localhost:9
+      IMAGE_STORAGE: local
+      FIXED_EXPENSE_DETECTION_CRON: "0 0 23 * * *"
+      CHALLENGE_TRIAL_DEADLINE_FIXED_DELAY_MS: ${DEADLINE_MS:-300000}
+      CHALLENGE_GROUP_EVALUATION_FIXED_DELAY_MS: ${EVALUATION_MS:-300000}
+      TZ: Asia/Seoul
+    ports:
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/api/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+volumes:
+  perf_mysql:

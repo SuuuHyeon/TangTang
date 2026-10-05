@@ -1,0 +1,367 @@
+diff --git a/apps/api/src/main/java/com/kb/tangtang/challenge/domain/GroupEvaluationWatermark.java b/apps/api/src/main/java/com/kb/tangtang/challenge/domain/GroupEvaluationWatermark.java
+new file mode 100644
+index 0000000..c94d2f8
+--- /dev/null
++++ b/apps/api/src/main/java/com/kb/tangtang/challenge/domain/GroupEvaluationWatermark.java
+@@ -0,0 +1,25 @@
++package com.kb.tangtang.challenge.domain;
++
++import lombok.Getter;
++import lombok.NoArgsConstructor;
++
++import java.time.LocalDate;
++import java.time.LocalDateTime;
++
++/**
++ * [perf-ts] 평가 배치 증분 처리의 기준 시각 ({@code tbl_batch_watermark} 한 행).
++ *
++ * <p>시각은 전부 <b>DB 시계</b>로 잰다. 비교 대상인 {@code tbl_transaction.updated_at} 을 DB 가 채우기 때문에,
++ * 앱 서버 시계를 섞으면 두 시계가 어긋난 만큼 변경을 놓친다.
++ */
++@Getter
++@NoArgsConstructor
++public class GroupEvaluationWatermark {
++
++    /** 마지막으로 끝까지 돈 실행의 시작 시각. 다음 실행은 이 시각 - 겹침 이후의 변경을 본다 */
++    private LocalDateTime lastStartedAt;
++    /** 마지막 전체 재계산의 시작 시각 */
++    private LocalDateTime lastFullAt;
++    /** 마지막 전체 재계산의 배치 기준일. 기준일이 바뀌면(자정) 전체를 다시 돈다 */
++    private LocalDate lastFullDate;
++}
+diff --git a/apps/api/src/main/java/com/kb/tangtang/challenge/mapper/ChallengeGroupMapper.java b/apps/api/src/main/java/com/kb/tangtang/challenge/mapper/ChallengeGroupMapper.java
+index d339a84..0669fce 100644
+--- a/apps/api/src/main/java/com/kb/tangtang/challenge/mapper/ChallengeGroupMapper.java
++++ b/apps/api/src/main/java/com/kb/tangtang/challenge/mapper/ChallengeGroupMapper.java
+@@ -5,6 +5,7 @@ import org.apache.ibatis.annotations.Mapper;
+ import org.apache.ibatis.annotations.Param;
+ 
+ import java.time.LocalDate;
++import java.time.LocalDateTime;
+ import java.util.List;
+ 
+ /**
+@@ -78,6 +79,22 @@ public interface ChallengeGroupMapper {
+                                               @Param("today") LocalDate today,
+                                               @Param("yesterday") LocalDate yesterday);
+ 
++    /**
++     * [perf-ts] 평가 배치 증분 처리: {@code since} 이후 결산이 달라졌을 수 있는 그룹 id.
++     *
++     * <p>세 경우를 합친다. 진행 중인지는 여기서 거르지 않는다 — 호출부가
++     * {@link #findGroupsToEvaluate} 결과와 겹치는 그룹만 계산한다.
++     * <ul>
++     *   <li>참여자의 어제·오늘 거래가 바뀌었다 (동기화의 새 결제, LLM 카테고리 변경, 환불·집계 제외)</li>
++     *   <li>참여자가 늘었다 — 시작일 참여(#350)는 이미 저장된 거래를 가진 채 들어온다</li>
++     *   <li>그룹 행이 바뀌었다 — 시작(ACTIVE 전이) 등</li>
++     * </ul>
++     * 거래 삭제와 자정에 새로 필요한 결산 행은 여기서 잡히지 않는다. 배치가 주기적으로 도는 전체 재계산이 맡는다.
++     */
++    List<Long> findChangedGroupIds(@Param("since") LocalDateTime since,
++                                   @Param("today") LocalDate today,
++                                   @Param("yesterday") LocalDate yesterday);
++
+     /**
+      * 평가가 끝나 재판(JUDGING)으로 넘길 그룹 (이슈 #169).
+      *
+diff --git a/apps/api/src/main/java/com/kb/tangtang/challenge/mapper/GroupEvaluationWatermarkMapper.java b/apps/api/src/main/java/com/kb/tangtang/challenge/mapper/GroupEvaluationWatermarkMapper.java
+new file mode 100644
+index 0000000..4db6a91
+--- /dev/null
++++ b/apps/api/src/main/java/com/kb/tangtang/challenge/mapper/GroupEvaluationWatermarkMapper.java
+@@ -0,0 +1,26 @@
++package com.kb.tangtang.challenge.mapper;
++
++import com.kb.tangtang.challenge.domain.GroupEvaluationWatermark;
++import org.apache.ibatis.annotations.Mapper;
++import org.apache.ibatis.annotations.Param;
++
++import java.time.LocalDate;
++import java.time.LocalDateTime;
++
++/**
++ * [perf-ts] {@code tbl_batch_watermark} 접근. 평가 배치 증분 처리의 기준 시각을 읽고 쓴다.
++ */
++@Mapper
++public interface GroupEvaluationWatermarkMapper {
++
++    /** DB 시계의 현재 시각. updated_at 과 같은 시계로 기준 시각을 잡기 위해 쓴다 */
++    LocalDateTime now();
++
++    /** 없으면 NULL — 처음 실행이라 무엇이 바뀌었는지 알 수 없다 */
++    GroupEvaluationWatermark find(@Param("batchName") String batchName);
++
++    int save(@Param("batchName") String batchName,
++             @Param("lastStartedAt") LocalDateTime lastStartedAt,
++             @Param("lastFullAt") LocalDateTime lastFullAt,
++             @Param("lastFullDate") LocalDate lastFullDate);
++}
+diff --git a/apps/api/src/main/java/com/kb/tangtang/challenge/service/GroupChallengeEvaluationBatchService.java b/apps/api/src/main/java/com/kb/tangtang/challenge/service/GroupChallengeEvaluationBatchService.java
+index c0c0e98..e89686c 100644
+--- a/apps/api/src/main/java/com/kb/tangtang/challenge/service/GroupChallengeEvaluationBatchService.java
++++ b/apps/api/src/main/java/com/kb/tangtang/challenge/service/GroupChallengeEvaluationBatchService.java
+@@ -2,12 +2,19 @@ package com.kb.tangtang.challenge.service;
+ 
+ import com.kb.tangtang.challenge.domain.ChallengeGroup;
+ import com.kb.tangtang.challenge.domain.ChallengeGroupStatus;
++import com.kb.tangtang.challenge.domain.GroupEvaluationWatermark;
+ import com.kb.tangtang.challenge.mapper.ChallengeGroupMapper;
++import com.kb.tangtang.challenge.mapper.GroupEvaluationWatermarkMapper;
+ import lombok.extern.log4j.Log4j2;
+ import org.springframework.stereotype.Service;
+ 
++import java.time.Duration;
+ import java.time.LocalDate;
++import java.time.LocalDateTime;
++import java.util.HashSet;
+ import java.util.List;
++import java.util.Set;
++import java.util.stream.Collectors;
+ 
+ /**
+  * 그룹 챌린지 평가·기소 배치 (이슈 #168).
+@@ -24,6 +31,16 @@ import java.util.List;
+  *   <li>기간평가(PERIOD) 기소 — {@code today > end_date} 여야 판정할 수 있다</li>
+  * </ul>
+  * {@code end_date >= 오늘} 으로 좁히면 둘 다 통째로 사라진다.
++ *
++ * <p><b>[perf-ts] 스케줄러는 {@link #runScheduled} 를 부른다.</b> 평소에는 지난 실행 이후 바뀐 사람의
++ * 그룹만 다시 계산하고(증분), 아래 경우에는 지금처럼 전체를 다시 계산한다(안전망).
++ * <ul>
++ *   <li>기준 시각이 없다 — 처음 실행이라 무엇이 바뀌었는지 모른다</li>
++ *   <li>배치 기준일이 바뀌었다 — 자정에는 거래가 안 바뀌어도 새 날짜의 결산 행이 필요하다</li>
++ *   <li>마지막 전체 재계산 뒤 {@link #FULL_INTERVAL} 이 지났다 — 거래 삭제처럼 updated_at 으로 못 잡는 변경을 바로잡는다</li>
++ * </ul>
++ * 증분이든 전체든 계산 방식은 같다(같은 SQL, 같은 묶음, 같은 격리수준). 고르는 대상만 다르다.
++ * DEV 수동 트리거는 지금처럼 {@link #evaluateActiveGroups}(전체)를 부른다.
+  */
+ @Service
+ @Log4j2
+@@ -36,13 +53,72 @@ public class GroupChallengeEvaluationBatchService {
+      */
+     static final int CHUNK_SIZE = 100;
+ 
++    /** [perf-ts] tbl_batch_watermark 의 행 이름 */
++    static final String WATERMARK_NAME = "group-challenge-evaluation";
++    /**
++     * [perf-ts] 기준 시각을 이만큼 겹쳐 읽는다. updated_at 은 커밋 시각이 아니라 문장 실행 시각이라,
++     * 지난 실행이 읽은 뒤에 커밋된 행은 지난 시작 시각보다 이른 시각을 달고 있다. 동기화 트랜잭션은
++     * 사용자 한 명의 거래를 저장하는 동안만 열려 있어 2분이면 충분하다고 본다(추정, 미측정).
++     */
++    static final Duration OVERLAP = Duration.ofMinutes(2);
++    /** [perf-ts] 전체 재계산(안전망) 주기 */
++    static final Duration FULL_INTERVAL = Duration.ofHours(1);
++
+     private final ChallengeGroupMapper challengeGroupMapper;
+     private final GroupChallengeEvaluationService evaluationService;
++    private final GroupEvaluationWatermarkMapper watermarkMapper;
+ 
+     public GroupChallengeEvaluationBatchService(ChallengeGroupMapper challengeGroupMapper,
+-                                                GroupChallengeEvaluationService evaluationService) {
++                                                GroupChallengeEvaluationService evaluationService,
++                                                GroupEvaluationWatermarkMapper watermarkMapper) {
+         this.challengeGroupMapper = challengeGroupMapper;
+         this.evaluationService = evaluationService;
++        this.watermarkMapper = watermarkMapper;
++    }
++
++    /**
++     * [perf-ts] 스케줄러 진입점. 증분으로 돌지 전체로 돌지 정하고, 다 돈 뒤에 기준 시각을 옮긴다.
++     *
++     * <p>기준 시각은 <b>계산이 끝난 뒤</b>에 저장한다. 중간에 예외로 빠지면 저장되지 않아 다음 실행이
++     * 같은 구간을 다시 본다. 다시 계산해도 결산은 UPSERT, 기소는 uk_ind_result 라 결과가 같다.
++     *
++     * @return 이번 실행에서 만든 기소 수
++     */
++    public int runScheduled(LocalDate today) {
++        long started = System.nanoTime();   // 대상 고르기까지 포함해 잰다
++        LocalDateTime startedAt = watermarkMapper.now();
++        GroupEvaluationWatermark mark = watermarkMapper.find(WATERMARK_NAME);
++        String reason = fullReason(mark, startedAt, today);
++
++        if (reason != null) {
++            int indicted = evaluateGroups(findActiveGroups(today), today, "전체(" + reason + ")", started);
++            watermarkMapper.save(WATERMARK_NAME, startedAt, startedAt, today);
++            return indicted;
++        }
++
++        LocalDateTime since = mark.getLastStartedAt().minus(OVERLAP);
++        Set<Long> changed = new HashSet<>(
++                challengeGroupMapper.findChangedGroupIds(since, today, today.minusDays(1)));
++        List<ChallengeGroup> targets = findActiveGroups(today).stream()
++                .filter(g -> changed.contains(g.getId()))
++                .collect(Collectors.toList());
++        int indicted = evaluateGroups(targets, today, "증분(since=" + since + ")", started);
++        watermarkMapper.save(WATERMARK_NAME, startedAt, mark.getLastFullAt(), mark.getLastFullDate());
++        return indicted;
++    }
++
++    /** 전체 재계산을 해야 하면 그 이유, 증분이면 NULL */
++    private static String fullReason(GroupEvaluationWatermark mark, LocalDateTime now, LocalDate today) {
++        if (mark == null) {
++            return "기준 시각 없음";
++        }
++        if (!today.equals(mark.getLastFullDate())) {
++            return "날짜 바뀜";
++        }
++        if (!mark.getLastFullAt().plus(FULL_INTERVAL).isAfter(now)) {
++            return "주기 도래";
++        }
++        return null;
+     }
+ 
+     /**
+@@ -53,10 +129,20 @@ public class GroupChallengeEvaluationBatchService {
+      * @return 이번 실행에서 만든 기소 수
+      */
+     public int evaluateActiveGroups(LocalDate today) {
+-        long started = System.nanoTime();   // [perf-ts] 한 틱에 걸린 시간을 로그로 남긴다
+-        List<ChallengeGroup> groups = challengeGroupMapper.findGroupsToEvaluate(
++        return evaluateGroups(findActiveGroups(today), today, "전체(수동)", System.nanoTime());
++    }
++
++    private List<ChallengeGroup> findActiveGroups(LocalDate today) {
++        return challengeGroupMapper.findGroupsToEvaluate(
+                 ChallengeGroupStatus.ACTIVE.name(), today, today.minusDays(1));
++    }
++
++    /** 주어진 그룹을 묶음 단위로 평가한다. 증분과 전체가 같은 길을 탄다 */
++    private int evaluateGroups(List<ChallengeGroup> groups, LocalDate today, String mode, long started) {
++        // [perf-ts] started 부터 끝날 때까지를 배치 1회 시간(elapsedMs)으로 로그에 남긴다
+         if (groups.isEmpty()) {
++            log.info("그룹 챌린지 평가 배치 완료 mode={} today={} 대상=0 기소=0 elapsedMs={}",
++                    mode, today, (System.nanoTime() - started) / 1_000_000);
+             return 0;
+         }
+ 
+@@ -82,8 +168,8 @@ public class GroupChallengeEvaluationBatchService {
+                 }
+             }
+         }
+-        log.info("그룹 챌린지 평가 배치 완료 today={} 대상={} 기소={} elapsedMs={}",
+-                today, groups.size(), indicted, (System.nanoTime() - started) / 1_000_000);
++        log.info("그룹 챌린지 평가 배치 완료 mode={} today={} 대상={} 기소={} elapsedMs={}",
++                mode, today, groups.size(), indicted, (System.nanoTime() - started) / 1_000_000);
+         return indicted;
+     }
+ }
+diff --git a/apps/api/src/main/java/com/kb/tangtang/challenge/service/GroupChallengeEvaluationScheduler.java b/apps/api/src/main/java/com/kb/tangtang/challenge/service/GroupChallengeEvaluationScheduler.java
+index 5834586..a024ee5 100644
+--- a/apps/api/src/main/java/com/kb/tangtang/challenge/service/GroupChallengeEvaluationScheduler.java
++++ b/apps/api/src/main/java/com/kb/tangtang/challenge/service/GroupChallengeEvaluationScheduler.java
+@@ -34,8 +34,9 @@ public class GroupChallengeEvaluationScheduler {
+         this.zoneId = ZoneId.of(zoneId);
+     }
+ 
++    /** [perf-ts] 증분/전체 판단은 배치 서비스가 한다 ({@link GroupChallengeEvaluationBatchService#runScheduled}) */
+     @Scheduled(fixedDelayString = "${challenge.group.evaluation.fixed-delay-ms}")
+     public void evaluateActiveGroups() {
+-        batchService.evaluateActiveGroups(LocalDate.now(zoneId));
++        batchService.runScheduled(LocalDate.now(zoneId));
+     }
+ }
+diff --git a/apps/api/src/main/resources/mapper/challenge/ChallengeGroupMapper.xml b/apps/api/src/main/resources/mapper/challenge/ChallengeGroupMapper.xml
+index a36e0e6..2cf18a8 100644
+--- a/apps/api/src/main/resources/mapper/challenge/ChallengeGroupMapper.xml
++++ b/apps/api/src/main/resources/mapper/challenge/ChallengeGroupMapper.xml
+@@ -107,6 +107,25 @@
+         ORDER BY g.id
+     </select>
+ 
++    <!--
++      [perf-ts] 평가 배치 증분 처리 (ChallengeGroupMapper#findChangedGroupIds 주석 참고).
++      첫 갈래는 idx_tx_updated_at(updated_at) 으로 바뀐 거래만 범위로 읽고, 참여자는 idx_gm_user 로 찾는다.
++      updated_at 인덱스가 없으면 거래 전체를 읽는다 — db/migration/20261004_add_transaction_updated_at_index.sql
++      tbl_group_member.joined_at, tbl_challenge_group.updated_at 에는 인덱스가 없다. 진행 중인 그룹과
++      참여자는 수천~수만 행이라 다 읽어도 수 ms 다.
++    -->
++    <select id="findChangedGroupIds" resultType="java.lang.Long">
++        SELECT m.group_id
++          FROM tbl_transaction t
++          JOIN tbl_group_member m ON m.user_id = t.user_id
++         WHERE t.updated_at &gt;= #{since}
++           AND t.tr_date IN (#{yesterday}, #{today})
++        UNION
++        SELECT group_id FROM tbl_group_member WHERE joined_at &gt;= #{since}
++        UNION
++        SELECT id FROM tbl_challenge_group WHERE updated_at &gt;= #{since}
++    </select>
++
+     <!--
+       재판 전이 배치(이슈 #169). idx_cg_status_start (status, start_date) 의 선행 컬럼만 탄다.
+       end_date 는 걸러 낸 뒤 평가되지만 ACTIVE 그룹 수 자체가 작아 문제되지 않는다.
+diff --git a/apps/api/src/main/resources/mapper/challenge/GroupEvaluationWatermarkMapper.xml b/apps/api/src/main/resources/mapper/challenge/GroupEvaluationWatermarkMapper.xml
+new file mode 100644
+index 0000000..0d665f4
+--- /dev/null
++++ b/apps/api/src/main/resources/mapper/challenge/GroupEvaluationWatermarkMapper.xml
+@@ -0,0 +1,28 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
++        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
++<!--
++  [perf-ts] 평가 배치 증분 처리 기준 시각 (db/migration/20261004_add_group_evaluation_watermark.sql)
++-->
++<mapper namespace="com.kb.tangtang.challenge.mapper.GroupEvaluationWatermarkMapper">
++
++    <select id="now" resultType="java.time.LocalDateTime">
++        SELECT NOW()
++    </select>
++
++    <select id="find" resultType="com.kb.tangtang.challenge.domain.GroupEvaluationWatermark">
++        SELECT last_started_at, last_full_at, last_full_date
++          FROM tbl_batch_watermark
++         WHERE batch_name = #{batchName}
++    </select>
++
++    <!-- 처음이면 INSERT, 있으면 세 값을 덮어쓴다 -->
++    <insert id="save">
++        INSERT INTO tbl_batch_watermark (batch_name, last_started_at, last_full_at, last_full_date)
++        VALUES (#{batchName}, #{lastStartedAt}, #{lastFullAt}, #{lastFullDate})
++        ON DUPLICATE KEY UPDATE
++            last_started_at = VALUES(last_started_at),
++            last_full_at    = VALUES(last_full_at),
++            last_full_date  = VALUES(last_full_date)
++    </insert>
++</mapper>
+diff --git a/db/migration/20261004_add_group_evaluation_watermark.sql b/db/migration/20261004_add_group_evaluation_watermark.sql
+new file mode 100644
+index 0000000..fca916a
+--- /dev/null
++++ b/db/migration/20261004_add_group_evaluation_watermark.sql
+@@ -0,0 +1,19 @@
++-- 신규 설치 시 실행: 예. schema.sql → seed.sql 뒤 migration 순서에 따라 실행한다.
++--
++-- [perf-ts] 그룹 챌린지 평가 배치의 증분 처리용 기준 시각 (프로젝트 종료 후 개인 포크에서 추가).
++-- 평가 배치는 5분마다 진행 중인 모든 그룹을 다시 합산했는데, 그사이 거래가 바뀌는 사람은 일부뿐이다.
++-- 그래서 평소에는 "지난 실행 이후 바뀐 사람의 그룹"만 다시 계산하고, 그 기준 시각을 여기에 남긴다.
++--
++--   last_started_at : 마지막으로 끝까지 돈 실행의 시작 시각 (DB 시계 기준). 다음 실행은 이 시각 - 겹침 이후를 본다
++--   last_full_at    : 마지막 전체 재계산의 시작 시각. 1시간이 지나면 다시 전체를 돈다 (삭제처럼 증분이 못 잡는 변경을 바로잡는 안전망)
++--   last_full_date  : 마지막 전체 재계산의 배치 기준일. 날짜가 바뀌면(자정) 전체를 돈다
++--
++-- 되돌리는 방법: DROP TABLE tbl_batch_watermark;
++CREATE TABLE IF NOT EXISTS tbl_batch_watermark (
++  batch_name      VARCHAR(50) NOT NULL,
++  last_started_at DATETIME    NOT NULL,
++  last_full_at    DATETIME    NOT NULL,
++  last_full_date  DATE        NOT NULL,
++  updated_at      DATETIME    NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
++  PRIMARY KEY (batch_name)
++) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='배치 증분 처리 기준 시각';
+diff --git a/db/migration/20261004_add_transaction_updated_at_index.sql b/db/migration/20261004_add_transaction_updated_at_index.sql
+new file mode 100644
+index 0000000..618daee
+--- /dev/null
++++ b/db/migration/20261004_add_transaction_updated_at_index.sql
+@@ -0,0 +1,10 @@
++-- 신규 설치 시 실행: 예. schema.sql → seed.sql 뒤 migration 순서에 따라 실행한다.
++--
++-- [perf-ts] 평가 배치 증분 처리용 인덱스 (프로젝트 종료 후 개인 포크에서 추가).
++-- "지난 실행 이후 updated_at 이 바뀐 거래"를 찾는다. 인덱스가 없으면 그 조회가 거래 전체를 읽어서
++-- 증분 처리가 전체 재계산보다 느려진다.
++-- 쓰기마다 인덱스 갱신이 하나 늘지만 updated_at 은 행마다 한 값이라 비용이 작다.
++-- ⚠ perf-ts/b-batch/add_index.sql 로 같은 이름의 인덱스를 이미 넣었다면 이 파일은 건너뛴다 (중복 이름 오류).
++--
++-- 되돌리는 방법: DROP INDEX idx_tx_updated_at ON tbl_transaction;
++CREATE INDEX idx_tx_updated_at ON tbl_transaction (updated_at);

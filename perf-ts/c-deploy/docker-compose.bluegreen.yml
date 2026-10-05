@@ -1,0 +1,99 @@
+# =====================================================================
+# [C] 개선 2: 블루그린 배포 실험용
+#
+# API 를 blue / green 두 벌 두고, nginx 가 둘 중 한쪽으로만 요청을 보낸다.
+# 새 버전은 쉬고 있는 쪽에 띄우고, 헬스체크가 통과하면 nginx 가 가리키는 곳을 바꾼다.
+#
+# DB · Redis 는 docker-compose.perf.yml 과 같은 프로젝트 이름(tangtang-perf)을 써서
+# 같은 볼륨(perf_mysql)을 그대로 이어 쓴다.
+#
+# 직접 up 하지 않고 setup_bluegreen.sh / deploy_v3_bluegreen.sh 로 다룬다.
+# =====================================================================
+name: tangtang-perf
+
+x-api: &api
+  environment:
+    APP_ENV: docker
+    JDBC_DRIVER: net.sf.log4jdbc.sql.jdbcapi.DriverSpy
+    JDBC_URL: jdbc:log4jdbc:mysql://db:3306/tangtang?useUnicode=true&characterEncoding=UTF-8&serverTimezone=Asia/Seoul
+    JDBC_USERNAME: tangtang
+    JDBC_PASSWORD: ${MYSQL_PASSWORD}
+    REDIS_HOST: redis
+    REDIS_PORT: 6379
+    JWT_SECRET: ${JWT_SECRET}
+    GOOGLE_OAUTH_CLIENT_ID: perf-dummy
+    GOOGLE_OAUTH_CLIENT_SECRET: perf-dummy
+    GOOGLE_OAUTH_REDIRECT_URI: http://localhost:5173/api/auth/google/callback
+    APP_FRONT_URL: http://localhost:5173
+    AUTH_COOKIE_SECURE: "false"
+    OPENAI_API_KEY: perf-dummy
+    CODEF_API_URL: http://localhost:9
+    CODEF_CLIENT_ID: perf-dummy
+    CODEF_CLIENT_SECRET: perf-dummy
+    MOCK_API_URL: http://localhost:9
+    MOCK_SERVER_BASE_URL: http://localhost:9
+    IMAGE_STORAGE: local
+    FIXED_EXPENSE_DETECTION_CRON: "0 0 23 * * *"
+    TZ: Asia/Seoul
+  depends_on:
+    db:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+  healthcheck:
+    test: ["CMD", "curl", "-f", "http://localhost:8080/api/health"]
+    interval: 5s
+    timeout: 5s
+    retries: 30
+  # 멈추라는 신호를 받은 뒤 처리 중인 요청을 마칠 시간
+  stop_grace_period: 30s
+
+services:
+  db:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: tangtang
+      MYSQL_USER: tangtang
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+      TZ: Asia/Seoul
+    ports:
+      - "127.0.0.1:3307:3306"
+    volumes:
+      - perf_mysql:/var/lib/mysql
+      - ../initdb:/docker-entrypoint-initdb.d:ro
+      - ../../db:/tangtang-db:ro
+    command: --character-set-server=utf8mb4 --collation-server=utf8mb4_general_ci
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api-blue:
+    <<: *api
+    image: tangtang-api:${BLUE_TAG:-v0}
+
+  api-green:
+    <<: *api
+    image: tangtang-api:${GREEN_TAG:-v0}
+
+  nginx:
+    image: nginx:1.27-alpine
+    ports:
+      - "127.0.0.1:8088:80"
+    volumes:
+      - ./nginx/conf.d:/etc/nginx/conf.d
+    depends_on:
+      - api-blue
+
+volumes:
+  perf_mysql:

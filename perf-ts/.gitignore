@@ -1,0 +1,8 @@
+.env.perf
+a-join/pairs.tsv
+b-lock/vote_pairs.tsv
+c-deploy/.bluegreen.state
+c-deploy/nginx/conf.d/default.conf
+.venv/
+__pycache__/
+*.pyc

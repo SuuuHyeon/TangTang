@@ -1,0 +1,283 @@
+From 31514c01728613b40343d6d7a137733410d617eb Mon Sep 17 00:00:00 2001
+From: perf <perf@local>
+Date: Sun, 4 Oct 2026 15:47:44 +0900
+Subject: [PATCH 2/2] =?UTF-8?q?perf:=20=ED=8F=89=EA=B0=80=20=EB=B0=B0?=
+ =?UTF-8?q?=EC=B9=98=20=EB=AC=B6=EC=9D=8C=20=EC=B2=98=EB=A6=AC=20+=20READ?=
+ =?UTF-8?q?=20COMMITTED?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ .../challenge/domain/IndictmentTarget.java    |  2 +
+ .../mapper/GroupChallengeResultMapper.java    | 13 ++++
+ .../GroupChallengeEvaluationBatchService.java | 28 ++++++-
+ .../GroupChallengeEvaluationService.java      | 78 +++++++++++++++++++
+ .../challenge/GroupChallengeResultMapper.xml  | 67 ++++++++++++++++
+ 5 files changed, 184 insertions(+), 4 deletions(-)
+
+diff --git a/apps/api/src/main/java/com/kb/tangtang/challenge/domain/IndictmentTarget.java b/apps/api/src/main/java/com/kb/tangtang/challenge/domain/IndictmentTarget.java
+index c292a71..d06d60f 100644
+--- a/apps/api/src/main/java/com/kb/tangtang/challenge/domain/IndictmentTarget.java
++++ b/apps/api/src/main/java/com/kb/tangtang/challenge/domain/IndictmentTarget.java
+@@ -36,6 +36,8 @@ public class IndictmentTarget {
+      * {@code tbl_indictment.result_id} 의 UNIQUE(uk_ind_result)가 여기에 걸린다.
+      */
+     private Long resultId;
++    /** 묶음 조회(findOverLimitDailyForGroups)에서만 채워진다. 그룹별 조회에서는 NULL */
++    private Long groupId;
+ 
+     private Long userId;
+ 
+diff --git a/apps/api/src/main/java/com/kb/tangtang/challenge/mapper/GroupChallengeResultMapper.java b/apps/api/src/main/java/com/kb/tangtang/challenge/mapper/GroupChallengeResultMapper.java
+index 83d9d01..5ff8827 100644
+--- a/apps/api/src/main/java/com/kb/tangtang/challenge/mapper/GroupChallengeResultMapper.java
++++ b/apps/api/src/main/java/com/kb/tangtang/challenge/mapper/GroupChallengeResultMapper.java
+@@ -206,4 +206,17 @@ public interface GroupChallengeResultMapper {
+      */
+     LocalDate findLastSettlementDate(@Param("groupId") Long groupId,
+                                      @Param("today") LocalDate today);
++
++    /* ── [perf-ts] 평가 배치 묶음 처리 ─────────────────────────────────────
++     * 아래 세 메서드는 위 upsertDailyResults · findOverLimitDaily · findDeductionOverflow 와
++     * SQL 이 같고 WHERE 의 그룹 조건만 IN 으로 넓힌 것이다. 그룹마다 문장을 보내던 것을
++     * 그룹 묶음당 한 번으로 줄이려고 둔다(GroupChallengeEvaluationService#evaluateChunk).
++     */
++    int upsertDailyResultsForGroups(@Param("groupIds") List<Long> groupIds,
++                                    @Param("challengeDate") LocalDate challengeDate);
++
++    List<IndictmentTarget> findOverLimitDailyForGroups(@Param("groupIds") List<Long> groupIds,
++                                                       @Param("challengeDate") LocalDate challengeDate);
++
++    List<GroupChallengeDailyResult> findDeductionOverflowForGroups(@Param("groupIds") List<Long> groupIds);
+ }
+diff --git a/apps/api/src/main/java/com/kb/tangtang/challenge/service/GroupChallengeEvaluationBatchService.java b/apps/api/src/main/java/com/kb/tangtang/challenge/service/GroupChallengeEvaluationBatchService.java
+index e74d274..c0c0e98 100644
+--- a/apps/api/src/main/java/com/kb/tangtang/challenge/service/GroupChallengeEvaluationBatchService.java
++++ b/apps/api/src/main/java/com/kb/tangtang/challenge/service/GroupChallengeEvaluationBatchService.java
+@@ -29,6 +29,13 @@ import java.util.List;
+ @Log4j2
+ public class GroupChallengeEvaluationBatchService {
+ 
++    /**
++     * [perf-ts] 한 트랜잭션에서 함께 평가하는 그룹 수.
++     * 그룹마다 문장 5개와 커밋 1번을 보내던 것을 묶음마다 한 번으로 줄인다.
++     * 너무 크게 잡으면 트랜잭션이 길어지고 실패 시 다시 도는 범위가 넓어진다.
++     */
++    static final int CHUNK_SIZE = 100;
++
+     private final ChallengeGroupMapper challengeGroupMapper;
+     private final GroupChallengeEvaluationService evaluationService;
+ 
+@@ -54,12 +61,25 @@ public class GroupChallengeEvaluationBatchService {
+         }
+ 
+         int indicted = 0;
+-        for (ChallengeGroup group : groups) {
++        for (int from = 0; from < groups.size(); from += CHUNK_SIZE) {
++            List<ChallengeGroup> chunk = groups.subList(from, Math.min(from + CHUNK_SIZE, groups.size()));
+             try {
+-                indicted += evaluationService.evaluate(group, today);
++                indicted += evaluationService.evaluateChunk(chunk, today);
+             } catch (RuntimeException e) {
+-                /* 한 그룹의 실패가 나머지를 막지 않는다. 5분 뒤 다음 실행이 다시 집어 간다 */
+-                log.error("그룹 챌린지 평가 실패 groupId={}", group.getId(), e);
++                /*
++                 * 묶음 하나가 실패하면 그 묶음만 원래 방식(그룹 하나 = 트랜잭션 하나)으로 다시 돈다.
++                 * 묶음 트랜잭션은 통째로 롤백됐고, 다시 돌려도 결산은 UPSERT, 기소는 uk_ind_result 라
++                 * 같은 결과가 된다. 그룹별 처리에서 한 그룹의 실패가 나머지를 막지 않는 것은 그대로다.
++                 */
++                log.warn("그룹 챌린지 묶음 평가 실패, 그룹별로 다시 평가한다 groupIds={}~{}",
++                        chunk.get(0).getId(), chunk.get(chunk.size() - 1).getId(), e);
++                for (ChallengeGroup group : chunk) {
++                    try {
++                        indicted += evaluationService.evaluate(group, today);
++                    } catch (RuntimeException ex) {
++                        log.error("그룹 챌린지 평가 실패 groupId={}", group.getId(), ex);
++                    }
++                }
+             }
+         }
+         log.info("그룹 챌린지 평가 배치 완료 today={} 대상={} 기소={} elapsedMs={}",
+diff --git a/apps/api/src/main/java/com/kb/tangtang/challenge/service/GroupChallengeEvaluationService.java b/apps/api/src/main/java/com/kb/tangtang/challenge/service/GroupChallengeEvaluationService.java
+index c30e51b..0959dbc 100644
+--- a/apps/api/src/main/java/com/kb/tangtang/challenge/service/GroupChallengeEvaluationService.java
++++ b/apps/api/src/main/java/com/kb/tangtang/challenge/service/GroupChallengeEvaluationService.java
+@@ -15,6 +15,7 @@ import lombok.extern.log4j.Log4j2;
+ import org.springframework.context.ApplicationEventPublisher;
+ import org.springframework.dao.DuplicateKeyException;
+ import org.springframework.stereotype.Service;
++import org.springframework.transaction.annotation.Isolation;
+ import org.springframework.transaction.annotation.Transactional;
+ 
+ import java.math.BigDecimal;
+@@ -22,6 +23,7 @@ import java.text.NumberFormat;
+ import java.time.LocalDate;
+ import java.time.format.DateTimeFormatter;
+ import java.util.ArrayList;
++import java.util.LinkedHashMap;
+ import java.util.List;
+ import java.util.Locale;
+ import java.util.Map;
+@@ -92,6 +94,82 @@ public class GroupChallengeEvaluationService {
+         return created;
+     }
+ 
++    /**
++     * [perf-ts] 그룹 여러 개를 트랜잭션 하나에서 평가한다. 판정 규칙은 {@link #evaluate} 와 같다.
++     *
++     * <p>그룹마다 문장을 보내지 않고, 같은 SQL 을 그룹 묶음에 IN 조건으로 한 번씩 보낸다.
++     * 기간평가 기소 대상만 그룹별로 본다 — 종료 다음 날 하루만 호출되는 경로라 그룹 수가 적다.
++     *
++     * <p><b>READ COMMITTED 로 실행한다.</b> REPEATABLE READ 에서 INSERT ... SELECT 는 원본
++     * tbl_transaction 의 읽은 행과 간격에 공유 넥스트키 락을 건다. 묶음이 커져 트랜잭션이 길어지면
++     * 그동안 오늘 결제 저장(INSERT)과 카테고리 갱신(UPDATE)이 기다리고, 카테고리 갱신과는
++     * 교착까지 생긴다(perf-ts 측정). 매 틱 다시 집계하는 값이라 문장 단위 최신 읽기로 충분하다.
++     *
++     * @return 이번 묶음에서 만든 기소 수
++     */
++    @Transactional(isolation = Isolation.READ_COMMITTED)
++    public int evaluateChunk(List<ChallengeGroup> groups, LocalDate today) {
++        Map<Long, ChallengeGroup> byId = new LinkedHashMap<>();
++        for (ChallengeGroup group : groups) {
++            byId.put(group.getId(), group);
++        }
++
++        /* 1. 날짜마다, 그 날짜가 기간 안에 드는 그룹만 모아 한 번에 재집계 */
++        Map<LocalDate, List<Long>> idsByDate = new LinkedHashMap<>();
++        for (LocalDate date : List.of(today.minusDays(1), today)) {
++            List<Long> ids = new ArrayList<>();
++            for (ChallengeGroup group : groups) {
++                if (!date.isBefore(group.getStartDate()) && !date.isAfter(group.getEndDate())) {
++                    ids.add(group.getId());
++                }
++            }
++            if (!ids.isEmpty()) {
++                resultMapper.upsertDailyResultsForGroups(ids, date);
++                idsByDate.put(date, ids);
++            }
++        }
++
++        /* 2. 감액 이상 행 경고 (evaluate 의 warnDeductionOverflow 와 같은 내용) */
++        for (GroupChallengeDailyResult row : resultMapper.findDeductionOverflowForGroups(new ArrayList<>(byId.keySet()))) {
++            log.warn("감액이 집계액을 넘었다 groupId={} userId={} date={} 집계={} 감액={}"
++                            + " — 환불·카테고리 재분류로 집계액이 줄었을 수 있다",
++                    row.getGroupId(), row.getUserId(), row.getChallengeDate(),
++                    row.getDailyAmount(), row.getVerdictDeductionAmount());
++        }
++
++        int created = 0;
++
++        /* 3-1. 일일평가: 방금 집계한 날짜를 묶음으로 다시 본다 */
++        for (Map.Entry<LocalDate, List<Long>> entry : idsByDate.entrySet()) {
++            List<Long> dailyIds = new ArrayList<>();
++            for (Long id : entry.getValue()) {
++                if (!EvalType.PERIOD.name().equals(byId.get(id).getEvalType())) {
++                    dailyIds.add(id);
++                }
++            }
++            if (dailyIds.isEmpty()) {
++                continue;
++            }
++            for (IndictmentTarget target : resultMapper.findOverLimitDailyForGroups(dailyIds, entry.getKey())) {
++                if (indict(byId.get(target.getGroupId()), target)) {
++                    created++;
++                }
++            }
++        }
++
++        /* 3-2. 기간평가: 챌린지가 끝난 그룹만, 그룹별로 */
++        for (ChallengeGroup group : groups) {
++            if (EvalType.PERIOD.name().equals(group.getEvalType()) && today.isAfter(group.getEndDate())) {
++                for (IndictmentTarget target : resultMapper.findOverLimitPeriod(group.getId())) {
++                    if (indict(group, target)) {
++                        created++;
++                    }
++                }
++            }
++        }
++        return created;
++    }
++
+     /**
+      * 이번 틱에 다시 집계할 날짜. 어제·오늘 중 챌린지 기간 안에 드는 것만 남긴다.
+      *
+diff --git a/apps/api/src/main/resources/mapper/challenge/GroupChallengeResultMapper.xml b/apps/api/src/main/resources/mapper/challenge/GroupChallengeResultMapper.xml
+index cf61c3b..71df891 100644
+--- a/apps/api/src/main/resources/mapper/challenge/GroupChallengeResultMapper.xml
++++ b/apps/api/src/main/resources/mapper/challenge/GroupChallengeResultMapper.xml
+@@ -476,4 +476,71 @@
+          WHERE r.group_id = #{groupId}
+            AND r.challenge_date &lt; #{today}
+     </select>
++
++    <!--
++      ── [perf-ts] 평가 배치 묶음 처리 ─────────────────────────────────────
++
++      upsertDailyResults · findOverLimitDaily · findDeductionOverflow 와 SQL 이 같다.
++      WHERE 의 그룹 조건만 IN 으로 넓혔다. 식을 고칠 때는 위 원본과 함께 고친다.
++
++      ⚠ 이 INSERT ... SELECT 를 REPEATABLE READ 에서 실행하면 원본(tbl_transaction)의 읽은 행과
++        그 사이 간격에 공유 넥스트키 락이 걸린다. 그룹 하나일 때는 잠깐이라 문제가 없지만 묶음이
++        커지면 오늘 결제 저장(INSERT)과 카테고리 갱신(UPDATE)이 기다리거나 교착에 빠진다.
++        그래서 호출부가 READ COMMITTED 로 실행한다(binlog_format=ROW 전제).
++    -->
++    <insert id="upsertDailyResultsForGroups">
++        INSERT INTO tbl_group_challenge_daily_result
++            (group_id, user_id, challenge_date, daily_amount, target_count)
++        SELECT m.group_id,
++               m.user_id,
++               #{challengeDate},
++               COALESCE(SUM(CASE WHEN t.is_refund = 1
++                                 THEN -COALESCE(t.refunded_amount, t.amount)
++                                 ELSE t.amount
++                            END), 0),
++               COALESCE(SUM(CASE WHEN t.id IS NOT NULL AND t.is_refund = 0
++                                 THEN 1 ELSE 0
++                            END), 0)
++          FROM tbl_group_member m
++          JOIN tbl_challenge_group g ON g.id = m.group_id
++          LEFT JOIN tbl_transaction t
++                 ON t.user_id = m.user_id
++                AND t.tr_date = #{challengeDate}
++                <include refid="consumptionFilter"/>
++         WHERE m.group_id IN <foreach collection="groupIds" item="gid" open="(" separator="," close=")">#{gid}</foreach>
++         GROUP BY m.group_id, m.user_id
++        ON DUPLICATE KEY UPDATE
++            daily_amount = VALUES(daily_amount),
++            target_count = VALUES(target_count)
++    </insert>
++
++    <select id="findOverLimitDailyForGroups" resultType="com.kb.tangtang.challenge.domain.IndictmentTarget">
++        SELECT r.id             AS result_id,
++               r.group_id       AS group_id,
++               r.user_id        AS user_id,
++               r.challenge_date AS challenge_date,
++               r.effective_amount AS amount,
++               <include refid="displayNickname"/> AS nickname
++          FROM tbl_group_challenge_daily_result r
++          JOIN tbl_challenge_group g ON g.id = r.group_id
++          JOIN tbl_user u ON u.id = r.user_id
++         WHERE r.group_id IN <foreach collection="groupIds" item="gid" open="(" separator="," close=")">#{gid}</foreach>
++           AND r.challenge_date = #{challengeDate}
++           AND r.effective_amount &gt; g.limit_amount
++           AND NOT EXISTS (SELECT 1 FROM tbl_indictment i WHERE i.result_id = r.id)
++         ORDER BY r.group_id, r.user_id
++    </select>
++
++    <select id="findDeductionOverflowForGroups"
++            resultType="com.kb.tangtang.challenge.domain.GroupChallengeDailyResult">
++        SELECT r.id, r.group_id, r.user_id, r.challenge_date,
++               r.daily_amount, r.verdict_deduction_amount, r.effective_amount, r.target_count
++          FROM tbl_group_challenge_daily_result r
++          JOIN tbl_challenge_group g ON g.id = r.group_id
++         WHERE r.group_id IN <foreach collection="groupIds" item="gid" open="(" separator="," close=")">#{gid}</foreach>
++           AND g.eval_type = 'DAILY'
++           AND r.verdict_deduction_amount &gt; 0
++           AND r.verdict_deduction_amount &gt; r.daily_amount
++         ORDER BY r.group_id, r.user_id, r.challenge_date
++    </select>
+ </mapper>
+-- 
+2.43.0
+
