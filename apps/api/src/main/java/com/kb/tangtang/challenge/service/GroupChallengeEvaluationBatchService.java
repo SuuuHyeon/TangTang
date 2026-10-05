@@ -46,6 +46,7 @@ public class GroupChallengeEvaluationBatchService {
      * @return 이번 실행에서 만든 기소 수
      */
     public int evaluateActiveGroups(LocalDate today) {
+        long started = System.nanoTime();   // [perf-ts] 한 틱에 걸린 시간을 로그로 남긴다
         List<ChallengeGroup> groups = challengeGroupMapper.findGroupsToEvaluate(
                 ChallengeGroupStatus.ACTIVE.name(), today, today.minusDays(1));
         if (groups.isEmpty()) {
@@ -61,7 +62,8 @@ public class GroupChallengeEvaluationBatchService {
                 log.error("그룹 챌린지 평가 실패 groupId={}", group.getId(), e);
             }
         }
-        log.info("그룹 챌린지 평가 배치 완료 today={} 대상={} 기소={}", today, groups.size(), indicted);
+        log.info("그룹 챌린지 평가 배치 완료 today={} 대상={} 기소={} elapsedMs={}",
+                today, groups.size(), indicted, (System.nanoTime() - started) / 1_000_000);
         return indicted;
     }
 }
