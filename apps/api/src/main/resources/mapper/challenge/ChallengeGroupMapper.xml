@@ -108,6 +108,25 @@
     </select>
 
     <!--
+      [perf-ts] 평가 배치 증분 처리 (ChallengeGroupMapper#findChangedGroupIds 주석 참고).
+      첫 갈래는 idx_tx_updated_at(updated_at) 으로 바뀐 거래만 범위로 읽고, 참여자는 idx_gm_user 로 찾는다.
+      updated_at 인덱스가 없으면 거래 전체를 읽는다 — db/migration/20261004_add_transaction_updated_at_index.sql
+      tbl_group_member.joined_at, tbl_challenge_group.updated_at 에는 인덱스가 없다. 진행 중인 그룹과
+      참여자는 수천~수만 행이라 다 읽어도 수 ms 다.
+    -->
+    <select id="findChangedGroupIds" resultType="java.lang.Long">
+        SELECT m.group_id
+          FROM tbl_transaction t
+          JOIN tbl_group_member m ON m.user_id = t.user_id
+         WHERE t.updated_at &gt;= #{since}
+           AND t.tr_date IN (#{yesterday}, #{today})
+        UNION
+        SELECT group_id FROM tbl_group_member WHERE joined_at &gt;= #{since}
+        UNION
+        SELECT id FROM tbl_challenge_group WHERE updated_at &gt;= #{since}
+    </select>
+
+    <!--
       재판 전이 배치(이슈 #169). idx_cg_status_start (status, start_date) 의 선행 컬럼만 탄다.
       end_date 는 걸러 낸 뒤 평가되지만 ACTIVE 그룹 수 자체가 작아 문제되지 않는다.
 

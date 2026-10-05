@@ -34,8 +34,9 @@ public class GroupChallengeEvaluationScheduler {
         this.zoneId = ZoneId.of(zoneId);
     }
 
+    /** [perf-ts] 증분/전체 판단은 배치 서비스가 한다 ({@link GroupChallengeEvaluationBatchService#runScheduled}) */
     @Scheduled(fixedDelayString = "${challenge.group.evaluation.fixed-delay-ms}")
     public void evaluateActiveGroups() {
-        batchService.evaluateActiveGroups(LocalDate.now(zoneId));
+        batchService.runScheduled(LocalDate.now(zoneId));
     }
 }

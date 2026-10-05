@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<!--
+  [perf-ts] 평가 배치 증분 처리 기준 시각 (db/migration/20261004_add_group_evaluation_watermark.sql)
+-->
+<mapper namespace="com.kb.tangtang.challenge.mapper.GroupEvaluationWatermarkMapper">
+
+    <select id="now" resultType="java.time.LocalDateTime">
+        SELECT NOW()
+    </select>
+
+    <select id="find" resultType="com.kb.tangtang.challenge.domain.GroupEvaluationWatermark">
+        SELECT last_started_at, last_full_at, last_full_date
+          FROM tbl_batch_watermark
+         WHERE batch_name = #{batchName}
+    </select>
+
+    <!-- 처음이면 INSERT, 있으면 세 값을 덮어쓴다 -->
+    <insert id="save">
+        INSERT INTO tbl_batch_watermark (batch_name, last_started_at, last_full_at, last_full_date)
+        VALUES (#{batchName}, #{lastStartedAt}, #{lastFullAt}, #{lastFullDate})
+        ON DUPLICATE KEY UPDATE
+            last_started_at = VALUES(last_started_at),
+            last_full_at    = VALUES(last_full_at),
+            last_full_date  = VALUES(last_full_date)
+    </insert>
+</mapper>

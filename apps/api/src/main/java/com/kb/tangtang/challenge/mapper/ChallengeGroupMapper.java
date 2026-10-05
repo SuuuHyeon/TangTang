@@ -5,6 +5,7 @@ import org.apache.ibatis.annotations.Mapper;
 import org.apache.ibatis.annotations.Param;
 
 import java.time.LocalDate;
+import java.time.LocalDateTime;
 import java.util.List;
 
 /**
@@ -77,6 +78,22 @@ public interface ChallengeGroupMapper {
     List<ChallengeGroup> findGroupsToEvaluate(@Param("status") String status,
                                               @Param("today") LocalDate today,
                                               @Param("yesterday") LocalDate yesterday);
+
+    /**
+     * [perf-ts] 평가 배치 증분 처리: {@code since} 이후 결산이 달라졌을 수 있는 그룹 id.
+     *
+     * <p>세 경우를 합친다. 진행 중인지는 여기서 거르지 않는다 — 호출부가
+     * {@link #findGroupsToEvaluate} 결과와 겹치는 그룹만 계산한다.
+     * <ul>
+     *   <li>참여자의 어제·오늘 거래가 바뀌었다 (동기화의 새 결제, LLM 카테고리 변경, 환불·집계 제외)</li>
+     *   <li>참여자가 늘었다 — 시작일 참여(#350)는 이미 저장된 거래를 가진 채 들어온다</li>
+     *   <li>그룹 행이 바뀌었다 — 시작(ACTIVE 전이) 등</li>
+     * </ul>
+     * 거래 삭제와 자정에 새로 필요한 결산 행은 여기서 잡히지 않는다. 배치가 주기적으로 도는 전체 재계산이 맡는다.
+     */
+    List<Long> findChangedGroupIds(@Param("since") LocalDateTime since,
+                                   @Param("today") LocalDate today,
+                                   @Param("yesterday") LocalDate yesterday);
 
     /**
      * 평가가 끝나 재판(JUDGING)으로 넘길 그룹 (이슈 #169).
